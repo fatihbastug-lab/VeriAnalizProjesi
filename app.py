@@ -2,11 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from scipy import stats
 
-# -----------------------------
-# 1) SAYFA AYARLARI
-# -----------------------------
+# ------------------------------------------------------------
+# 0) SAYFA AYARLARI
+# ------------------------------------------------------------
 st.set_page_config(page_title="Karne Analiz Pro", layout="wide")
 
 st.markdown(
@@ -19,165 +18,183 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# -----------------------------
-# 2) YARDIMCI FONKSİYONLAR
-# -----------------------------
+# ------------------------------------------------------------
+# 1) YARDIMCI: KOLON TEMİZLEME
+# ------------------------------------------------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Kolon adlarını temizler: baş/son boşluk, tekrar eden boşluklar, unicode vb."""
     df = df.copy()
     df.columns = (
         df.columns.astype(str)
         .str.strip()
         .str.replace(r"\s+", " ", regex=True)
     )
-    # "Unnamed" ve tamamen boş kolonlar
+    # Unnamed ve tamamen boş kolonları sil
     df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", case=False, regex=True)]
     df = df.dropna(how="all", axis=1)
     return df
 
 
-def detect_header_row_csv(file, n=60, min_non_na=3):
+# ------------------------------------------------------------
+# 2) YARDIMCI: CSV HEADER TESPİTİ (GÜVENLİ)
+# ------------------------------------------------------------
+def detect_header_row_csv(file_like, nrows=60, min_non_na=3) -> int:
     """
-    CSV dosyada header satırını bulmaya çalışır.
-    - İlk n satırı header=None okuyup, doluluk oranı en iyi satırı seçer.
+    İlk nrows satırı header=None okur.
+    Doluluk oranı yüksek olan satırı header kabul eder.
+    Hiç aday yoksa 0 döner.
     """
-    df_test = pd.read_csv(file, nrows=n, header=None, dtype=str, engine="python")
-    # Her satırda kaç hücre dolu?
-    filled = df_test.notna().sum(axis=1)
-    # min_non_na altında kalanları ele
+    test = pd.read_csv(file_like, nrows=nrows, header=None, dtype=str, engine="python")
+    filled = test.notna().sum(axis=1)
     candidates = filled[filled >= min_non_na]
     if candidates.empty:
         return 0
-    # En dolu satırın indexi
     return int(candidates.idxmax())
 
 
+# ------------------------------------------------------------
+# 3) DOSYA OKUMA (CACHE'LI)
+# ------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def smart_load_cached(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """
-    Cache'li loader: Streamlit uploader her seferinde dosyayı yeniden okumasın.
-    """
+def smart_load(file_bytes: bytes, filename: str) -> pd.DataFrame:
     import io
 
-    file = io.BytesIO(file_bytes)
-    file.name = filename  # detect_header_row_csv bunu kullanıyor
+    bio = io.BytesIO(file_bytes)
+    bio.name = filename
 
     if filename.lower().endswith(".csv"):
-        # header satırını tespit et
-        file.seek(0)
-        header_row = detect_header_row_csv(file)
-        file.seek(0)
-        df = pd.read_csv(file, skiprows=header_row, engine="python")
+        bio.seek(0)
+        header_row = detect_header_row_csv(bio)
+        bio.seek(0)
+        df = pd.read_csv(bio, skiprows=header_row, engine="python")
     else:
-        file.seek(0)
-        df = pd.read_excel(file)
+        bio.seek(0)
+        df = pd.read_excel(bio)
         df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
 
     df = normalize_columns(df)
     return df
 
 
-def pick_person_col(df: pd.DataFrame) -> str | None:
-    """Sicil yoksa olası personel kolonu seçmeye çalış."""
-    preferred = ["Sicil", "SİCİL", "TC", "T.C.", "Personel", "Personel No", "Employee", "ID"]
-    for c in preferred:
+# ------------------------------------------------------------
+# 4) YARDIMCI: PERSONEL KOLONU TAHMİNİ
+# ------------------------------------------------------------
+def guess_person_col(df: pd.DataFrame) -> str | None:
+    candidates = ["Sicil", "SİCİL", "Personel", "Personel No", "Employee", "ID"]
+    for c in candidates:
         if c in df.columns:
             return c
-    # Alternatif: benzersizliği yüksek olan string kolonu
+
     obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
     if not obj_cols:
         return None
-    uniq = {c: df[c].nunique(dropna=True) for c in obj_cols}
-    # Çok küçük uniq genelde kategori olur; çok büyük uniq id olabilir. Orta-üst seçelim.
-    return max(uniq, key=uniq.get) if uniq else None
+
+    nun = {c: df[c].nunique(dropna=True) for c in obj_cols}
+    return max(nun, key=nun.get) if nun else None
 
 
-def build_filters(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Dinamik filtre:
-    - kategorik: multiselect
-    - sayısal: slider (min-max)
-    - tarih: date_input (min-max)
-    """
-    st.sidebar.subheader("🎯 Dinamik Filtreler")
-    cols = st.sidebar.multiselect("Filtrelemek istediğiniz sütunları seçin:", df.columns)
-
-    out = df.copy()
-
-    for col in cols:
-        series = out[col]
-
-        # Tarih denemesi
-        if series.dtype == "object":
-            # küçük bir örnekle datetime parse deneyelim
-            sample = series.dropna().astype(str).head(50)
-            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
-            is_date_like = parsed.notna().mean() > 0.6
-        else:
-            is_date_like = np.issubdtype(series.dtype, np.datetime64)
-
-        if is_date_like:
-            dt = pd.to_datetime(out[col], errors="coerce", dayfirst=True)
-            min_d, max_d = dt.min(), dt.max()
-            if pd.isna(min_d) or pd.isna(max_d):
-                st.sidebar.info(f"{col} sütununda tarih filtrelemesi için yeterli veri yok.")
-                continue
-
-            start, end = st.sidebar.date_input(
-                f"📅 {col} tarih aralığı",
-                value=(min_d.date(), max_d.date()),
-                min_value=min_d.date(),
-                max_value=max_d.date(),
-            )
-            out = out[(dt.dt.date >= start) & (dt.dt.date <= end)]
-            continue
-
-        # Sayısal
-        if np.issubdtype(series.dtype, np.number):
-            min_v = float(np.nanmin(series.values)) if series.notna().any() else 0.0
-            max_v = float(np.nanmax(series.values)) if series.notna().any() else 0.0
-            if min_v == max_v:
-                st.sidebar.caption(f"{col}: tek değer ({min_v}) olduğu için slider gösterilmedi.")
-                continue
-            vmin, vmax = st.sidebar.slider(f"🔢 {col} aralığı", min_v, max_v, (min_v, max_v))
-            out = out[(out[col] >= vmin) & (out[col] <= vmax)]
-            continue
-
-        # Kategorik (çok fazla unique varsa arama kutusu gibi davranır)
-        unique_vals = out[col].dropna().unique().tolist()
-        unique_vals_sorted = sorted(unique_vals, key=lambda x: str(x))
-        default_vals = unique_vals_sorted if len(unique_vals_sorted) <= 200 else unique_vals_sorted[:200]
-        selected = st.sidebar.multiselect(f"🏷️ {col} seçimi", unique_vals_sorted, default=default_vals)
-        if selected:
-            out = out[out[col].isin(selected)]
-
-    return out
+# ------------------------------------------------------------
+# 5) YARDIMCI: TARİH BENZERLİĞİ TESPİTİ
+# ------------------------------------------------------------
+def is_date_like(series: pd.Series) -> bool:
+    if np.issubdtype(series.dtype, np.datetime64):
+        return True
+    if series.dtype != "object":
+        return False
+    sample = series.dropna().astype(str).head(50)
+    if sample.empty:
+        return False
+    parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+    return parsed.notna().mean() > 0.6
 
 
-# -----------------------------
-# 3) SIDEBAR
-# -----------------------------
+# ------------------------------------------------------------
+# 6) YARDIMCI: Z-SCORE (SciPy'siz)
+# ------------------------------------------------------------
+def zscore_abs(s: pd.Series) -> pd.Series:
+    x = pd.to_numeric(s, errors="coerce")
+    mu = x.mean()
+    sd = x.std(ddof=0)
+    if sd == 0 or np.isnan(sd):
+        return pd.Series(np.nan, index=s.index)
+    return ((x - mu) / sd).abs()
+
+
+# ------------------------------------------------------------
+# 7) SIDEBAR
+# ------------------------------------------------------------
 st.sidebar.title("🛠️ Analiz Ayarları")
 uploaded_file = st.sidebar.file_uploader("Karne/Ham Data Dosyasını Yükle", type=["csv", "xlsx"])
 
 if not uploaded_file:
     st.header("📂 Başlamak için Karne Dosyasını Yükleyin")
-    st.info("Bu program, 'KARNE ÇALIŞMA GÜNCEL' benzeri dosyalardaki karmaşık yapıyı otomatik çözer.")
+    st.info("Bu uygulama, karne/ham veri dosyalarını otomatik temizler ve analiz eder.")
     st.stop()
 
-# Dosyayı oku (cache'li)
-file_bytes = uploaded_file.getvalue()
-df_raw = smart_load_cached(file_bytes, uploaded_file.name)
+# Dosya okuma (hata yakala)
+try:
+    file_bytes = uploaded_file.getvalue()
+    df_raw = smart_load(file_bytes, uploaded_file.name)
+except Exception as e:
+    st.error("Dosya okunurken hata oluştu. Format beklenenden farklı olabilir.")
+    st.exception(e)
+    st.stop()
 
-# Filtre uygula
-df = build_filters(df_raw)
+# ------------------------------------------------------------
+# 8) DİNAMİK FİLTRELER
+# ------------------------------------------------------------
+df = df_raw.copy()
+st.sidebar.subheader("🎯 Dinamik Filtreler")
 
-# -----------------------------
-# 4) ANA PANEL
-# -----------------------------
-st.title("📊 Gelişmiş Operasyonel Analiz")
+filter_cols = st.sidebar.multiselect("Filtrelemek istediğiniz sütunları seçin:", df.columns)
 
-person_col = pick_person_col(df)
+for col in filter_cols:
+    s = df[col]
+
+    # Tarih
+    if is_date_like(s):
+        dt = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+        min_d, max_d = dt.min(), dt.max()
+        if pd.isna(min_d) or pd.isna(max_d):
+            st.sidebar.caption(f"{col}: Tarih filtrelemek için yeterli veri yok.")
+            continue
+
+        start, end = st.sidebar.date_input(
+            f"📅 {col} tarih aralığı",
+            value=(min_d.date(), max_d.date()),
+            min_value=min_d.date(),
+            max_value=max_d.date(),
+        )
+        df = df[(dt.dt.date >= start) & (dt.dt.date <= end)]
+        continue
+
+    # Sayısal
+    if np.issubdtype(s.dtype, np.number):
+        if s.dropna().empty:
+            st.sidebar.caption(f"{col}: Boş sayısal sütun.")
+            continue
+        min_v = float(np.nanmin(s.values))
+        max_v = float(np.nanmax(s.values))
+        if min_v == max_v:
+            st.sidebar.caption(f"{col}: Tek değer ({min_v}).")
+            continue
+        vmin, vmax = st.sidebar.slider(f"🔢 {col} aralığı", min_v, max_v, (min_v, max_v))
+        df = df[(df[col] >= vmin) & (df[col] <= vmax)]
+        continue
+
+    # Kategorik
+    unique_vals = df[col].dropna().unique().tolist()
+    unique_vals = sorted(unique_vals, key=lambda x: str(x))
+    default_vals = unique_vals if len(unique_vals) <= 200 else unique_vals[:200]
+    selected = st.sidebar.multiselect(f"🏷️ {col} seçimi", unique_vals, default=default_vals)
+    if selected:
+        df = df[df[col].isin(selected)]
+
+# ------------------------------------------------------------
+# 9) ÜST KPI'LAR
+# ------------------------------------------------------------
+st.title("📊 Karne Analiz Pro (Yeniden Yazılmış)")
+
+person_col = guess_person_col(df)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Toplam Satır", f"{len(df):,}")
@@ -185,43 +202,53 @@ m2.metric("Sütun Sayısı", f"{len(df.columns):,}")
 m3.metric("Benzersiz Personel", df[person_col].nunique() if person_col else "N/A")
 m4.metric("Hata Oranı (%)", round((df.isnull().sum().sum() / max(df.size, 1)) * 100, 2))
 
-t_data, t_pivot, t_stat, t_viz = st.tabs(["📋 Ham Veri", "🧮 Pivot Tablo", "🔬 İstatistiksel Test", "🎨 Grafik Lab"])
+# Büyük veri için örnekleme (grafikler hızlansın)
+MAX_VIZ = 30000
+df_viz = df.sample(MAX_VIZ, random_state=42) if len(df) > MAX_VIZ else df
 
-# --- Ham Veri
+# ------------------------------------------------------------
+# 10) SEKME YAPISI
+# ------------------------------------------------------------
+t_data, t_pivot, t_stat, t_viz = st.tabs(
+    ["📋 Ham Veri", "🧮 Pivot Tablo", "🔬 Aykırı Değer", "🎨 Grafik Lab"]
+)
+
+# ------------------ Ham Veri ------------------
 with t_data:
     st.subheader("Temizlenmiş Veri Önizlemesi")
     st.dataframe(df, use_container_width=True)
 
-# --- Pivot
+# ------------------ Pivot ------------------
 with t_pivot:
-    st.subheader("🧮 Dinamik Özetleyici (Pivot)")
+    st.subheader("🧮 Dinamik Pivot")
 
     group_col = st.selectbox("Gruplandırma (Satır):", df.columns, index=0)
 
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     if not num_cols:
-        st.warning("Pivot için sayısal sütun bulunamadı. (Örn: skor, adet, süre vb.)")
+        st.warning("Pivot için sayısal sütun yok. (Örn: skor, adet, süre)")
     else:
-        calc_col = st.selectbox("Hesaplanacak Sütun (Sayı):", num_cols)
-        agg_choice = st.multiselect("Agregasyonlar:", ["mean", "sum", "count", "median", "min", "max"], default=["mean", "sum", "count"])
+        calc_col = st.selectbox("Hesaplanacak Sayısal Sütun:", num_cols)
+        agg_choice = st.multiselect(
+            "Agregasyonlar:", ["mean", "sum", "count", "median", "min", "max"],
+            default=["mean", "sum", "count"]
+        )
 
-        pivot_table = df.groupby(group_col)[calc_col].agg(agg_choice).reset_index()
-        st.dataframe(pivot_table, use_container_width=True)
+        pivot = df.groupby(group_col)[calc_col].agg(agg_choice).reset_index()
+        st.dataframe(pivot, use_container_width=True)
 
-        if "mean" in pivot_table.columns:
-            fig_p = px.bar(pivot_table, x=group_col, y="mean", title=f"{group_col} Bazında Ortalama ({calc_col})")
-            st.plotly_chart(fig_p, use_container_width=True)
-        else:
-            fig_p = px.bar(pivot_table, x=group_col, y=agg_choice[0], title=f"{group_col} Bazında {agg_choice[0]} ({calc_col})")
-            st.plotly_chart(fig_p, use_container_width=True)
+        # Basit görselleştirme
+        y_col = "mean" if "mean" in pivot.columns else agg_choice[0]
+        fig = px.bar(pivot, x=group_col, y=y_col, title=f"{group_col} Bazında {y_col}({calc_col})")
+        st.plotly_chart(fig, use_container_width=True)
 
-# --- İstatistik / Aykırı
+# ------------------ Aykırı Değer ------------------
 with t_stat:
-    st.subheader("🔬 Derin İstatistik: Aykırı Değerler")
+    st.subheader("🔬 Aykırı Değer Analizi")
 
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     if not num_cols:
-        st.warning("İstatistiksel analiz için sayısal sütun bulunamadı.")
+        st.warning("Aykırı değer analizi için sayısal sütun yok.")
     else:
         num_col = st.selectbox("Analiz Sütunu:", num_cols)
         method = st.radio("Yöntem:", ["Z-Score (|z|>3)", "IQR (1.5x)"], horizontal=True)
@@ -229,32 +256,34 @@ with t_stat:
         s = df[num_col]
 
         if method.startswith("Z-Score"):
-            clean = s.dropna()
+            clean = pd.to_numeric(s, errors="coerce").dropna()
             if clean.nunique() <= 1:
-                st.info("Bu sütunda varyans yok gibi görünüyor; z-score anlamlı değil.")
+                st.info("Bu sütunda varyans yok; z-score anlamlı değil.")
+                df_out = df.iloc[0:0]
             else:
-                z = pd.Series(np.abs(stats.zscore(clean)), index=clean.index)
+                z = zscore_abs(clean)
                 out_idx = z[z > 3].index
-                df_outliers = df.loc[out_idx]
+                df_out = df.loc[out_idx]
         else:
-            q1 = s.quantile(0.25)
-            q3 = s.quantile(0.75)
+            x = pd.to_numeric(s, errors="coerce")
+            q1, q3 = x.quantile(0.25), x.quantile(0.75)
             iqr = q3 - q1
-            low = q1 - 1.5 * iqr
-            high = q3 + 1.5 * iqr
-            df_outliers = df[(s < low) | (s > high)]
+            low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            df_out = df[(x < low) | (x > high)]
 
         c1, c2 = st.columns(2)
         with c1:
-            st.error(f"⚠️ Saptanan Uç Değer Sayısı: {len(df_outliers)}")
-            st.dataframe(df_outliers, use_container_width=True)
-        with c2:
-            fig_box = px.box(df, y=num_col, points="all", title=f"{num_col} Dağılımı ve Sapmalar")
-            st.plotly_chart(fig_box, use_container_width=True)
+            st.error(f"⚠️ Uç değer sayısı: {len(df_out)}")
+            st.dataframe(df_out, use_container_width=True)
 
-# --- Grafik Lab
+        with c2:
+            # points="all" büyük veride ağır; df_viz ile hızlandırıyoruz
+            fig = px.box(df_viz, y=num_col, points="outliers", title=f"{num_col} Dağılımı (Örneklenmiş)")
+            st.plotly_chart(fig, use_container_width=True)
+
+# ------------------ Grafik Lab ------------------
 with t_viz:
-    st.subheader("🎨 Özel Grafik Oluşturucu")
+    st.subheader("🎨 Grafik Lab")
 
     chart_type = st.selectbox("Grafik Tipi:", ["Scatter (Trend)", "Bar", "Histogram", "Box"])
 
@@ -264,11 +293,17 @@ with t_viz:
     if chart_type == "Scatter (Trend)":
         c1, c2, c3 = st.columns(3)
         x_ax = c1.selectbox("X Ekseni:", all_cols, key="x")
-        y_ax = c2.selectbox("Y Ekseni (sayısal):", num_cols, key="y")
-        color_ax = c3.selectbox("Renk Ayrımı (kategori):", [None] + all_cols, key="c")
+        y_ax = c2.selectbox("Y Ekseni (sayısal):", num_cols, key="y") if num_cols else None
+        color_ax = c3.selectbox("Renk (opsiyonel):", [None] + all_cols, key="c")
 
-        fig = px.scatter(df, x=x_ax, y=y_ax, color=color_ax, trendline="ols", title="Değişkenler Arası İlişki ve Trend")
-        st.plotly_chart(fig, use_container_width=True)
+        if not y_ax:
+            st.warning("Scatter için sayısal Y sütunu yok.")
+        else:
+            fig = px.scatter(
+                df_viz, x=x_ax, y=y_ax, color=color_ax,
+                trendline="ols", title="İlişki & Trend (Örneklenmiş)"
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
     elif chart_type == "Bar":
         cat_col = st.selectbox("Kategori (X):", all_cols)
@@ -286,7 +321,7 @@ with t_viz:
             st.warning("Histogram için sayısal sütun yok.")
         else:
             col = st.selectbox("Sütun:", num_cols)
-            fig = px.histogram(df, x=col, title=f"{col} Histogram")
+            fig = px.histogram(df_viz, x=col, title=f"{col} Histogram (Örneklenmiş)")
             st.plotly_chart(fig, use_container_width=True)
 
     else:  # Box
@@ -295,5 +330,5 @@ with t_viz:
         else:
             y = st.selectbox("Y (sayısal):", num_cols)
             x = st.selectbox("X (opsiyonel kategori):", [None] + all_cols)
-            fig = px.box(df, y=y, x=x, points="all", title="Box Plot")
+            fig = px.box(df_viz, y=y, x=x, points="outliers", title="Box Plot (Örneklenmiş)")
             st.plotly_chart(fig, use_container_width=True)
